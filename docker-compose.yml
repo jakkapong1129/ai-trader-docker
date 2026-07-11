@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: ai_trader_db
+    restart: always
+    environment:
+      POSTGRES_DB: ai_trader
+      POSTGRES_USER: trader_user
+      POSTGRES_PASSWORD: trader_password_safe_99
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader_user -d ai_trader"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: ai_trader_api
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://trader_user:trader_password_safe_99@db:5432/ai_trader
+      - PORT=8000
+    ports:
+      - "0.0.0.0:8001:8000"
+    volumes:
+      - shared_data:/app/shared
+    depends_on:
+      db:
+        condition: service_healthy
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: ai_trader_bot
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://trader_user:trader_password_safe_99@db:5432/ai_trader
+      - API_SERVER_URL=http://api:8000
+    volumes:
+      - shared_data:/app/shared
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  shared_data:
