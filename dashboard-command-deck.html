@@ -144,7 +144,7 @@ button{font:inherit}.mono,.metric-value,.num,td:not(:nth-child(2)){font-family:v
             <div><span>Amount</span><b id="posAmount">฿0</b></div>
             <div><span>Entry</span><b id="posEntry">0.0</b></div>
             <div><span>Current</span><b id="posCurrent">0.0</b></div>
-            <div><span>Live P/L</span><b id="posProfit">+฿0.00</b></div>
+            <div><span>Live P/L / Status</span><b id="posProfit">--</b></div>
           </div>
         </div>
       </article>
@@ -199,6 +199,7 @@ button{font:inherit}.mono,.metric-value,.num,td:not(:nth-child(2)){font-family:v
       <div class="panel-tools">
         <button class="chip">Search</button>
         <button class="chip">Export CSV</button>
+        <button class="chip danger" id="clearHistoryBtn" onclick="clearSelectedHistory()">Clear history</button>
       </div>
     </header>
     <div class="table-scroll">
@@ -213,11 +214,10 @@ button{font:inherit}.mono,.metric-value,.num,td:not(:nth-child(2)){font-family:v
             <th>MG</th>
             <th>Result</th>
             <th>Profit</th>
-            <th>Balance</th>
           </tr>
         </thead>
         <tbody id="tradeHistoryBody">
-          <tr><td colspan="9" style="text-align:center;color:var(--faint)">No trade records yet</td></tr>
+          <tr><td colspan="8" style="text-align:center;color:var(--faint)">No trade records yet</td></tr>
         </tbody>
       </table>
     </div>
@@ -290,8 +290,19 @@ let currentBotPhase = 'Stopped';
 function dateFromBroker(value) {
   if (!value) return null;
   if (typeof value === 'number') return new Date(value < 1e12 ? value * 1000 : value);
-  const parsed = new Date(value);
+  const timestamp = String(value).trim();
+  const normalizedTimestamp = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(timestamp)
+    ? timestamp
+    : `${timestamp}Z`;
+  const parsed = new Date(normalizedTimestamp);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatLocalTime(value) {
+  const date = dateFromBroker(value);
+  return date
+    ? date.toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit', second: '2-digit'})
+    : '--:--:--';
 }
 
 function formatRemaining(target, fallback = '--:--') {
@@ -352,7 +363,7 @@ let lastDashboardState = null;
 
 async function loadAccountHistory(type) {
   try {
-    const response = await fetch(`/api/trades?account_type=${encodeURIComponent(type)}&limit=10`);
+    const response = await fetch(`/api/trades?account_type=${encodeURIComponent(type)}&limit=100`);
     if (!response.ok) throw new Error('history request failed');
     const data = await response.json();
     accountHistories[type] = Array.isArray(data.history) ? data.history : [];
@@ -361,6 +372,26 @@ async function loadAccountHistory(type) {
     console.error(`Failed to load ${type} trade history`, error);
     accountHistories[type] = [];
     if (lastDashboardState && activeAccountType === type) updateDashboard(lastDashboardState);
+  }
+}
+
+async function clearSelectedHistory() {
+  const accountLabel = activeAccountType.toUpperCase();
+  if (!window.confirm(`Delete all ${accountLabel} trade history? This cannot be undone.`)) return;
+
+  try {
+    const response = await fetch(`/api/trades/${activeAccountType}`, {method: 'DELETE'});
+    const data = await response.json();
+    if (!response.ok || data.status !== 'success') {
+      showToast(data.detail || data.message || 'Could not clear history');
+      return;
+    }
+    accountHistories[activeAccountType] = [];
+    if (lastDashboardState) updateDashboard(lastDashboardState);
+    showToast(`Deleted ${data.deleted_count} ${accountLabel} trade record(s)`);
+  } catch (error) {
+    console.error('Failed to clear trade history', error);
+    showToast('Failed to reach API server');
   }
 }
 
@@ -524,6 +555,13 @@ function updateDashboard(state) {
     button.style.opacity = lockAccountSwitch ? '0.5' : '';
     button.style.cursor = lockAccountSwitch ? 'not-allowed' : '';
   });
+  const clearHistoryButton = document.getElementById('clearHistoryBtn');
+  if (clearHistoryButton) {
+    clearHistoryButton.disabled = lockAccountSwitch;
+    clearHistoryButton.title = lockAccountSwitch ? 'Pause or stop the bot before clearing history' : '';
+    clearHistoryButton.style.opacity = lockAccountSwitch ? '0.5' : '';
+    clearHistoryButton.style.cursor = lockAccountSwitch ? 'not-allowed' : '';
+  }
 
   valRound.textContent = `#${state.round_num}`;
   
@@ -582,9 +620,22 @@ function updateDashboard(state) {
     const assetName = positionValue('asset_name', 'asset', 'symbol') || pendingPosition?.asset_name || '--';
     const direction = positionValue('direction', 'option_type', 'side') || pendingPosition?.direction || '--';
     const amount = positionValue('amount', 'invest', 'investment') ?? pendingPosition?.amount;
-    const entryPrice = positionValue('open_price', 'entry_price', 'openPrice') ?? pendingPosition?.open_price;
-    const currentPrice = positionValue('current_price', 'price', 'currentPrice');
-    const liveProfit = positionValue('profit', 'pnl', 'current_profit', 'profit_amount');
+    const numericPositionValue = (...keys) => {
+      const value = positionValue(...keys);
+      if (value === '' || value === null) return null;
+      const numericValue = Number(value);
+      return Number.isFinite(numericValue) ? numericValue : null;
+    };
+    const entryPrice = numericPositionValue('open_price', 'entry_price', 'openPrice') ?? pendingPosition?.open_price;
+    const currentPrice = numericPositionValue('current_price', 'price', 'currentPrice');
+    const liveProfit = numericPositionValue(
+      'sell_profit',
+      'profit',
+      'pnl',
+      'current_profit',
+      'profit_amount',
+      'expected_profit'
+    );
     positionExpiryAt = dateFromBroker(positionValue('expiration_time', 'expiry_time', 'expiration', 'close_at'));
     refreshCountdowns();
 
@@ -596,9 +647,18 @@ function updateDashboard(state) {
     document.getElementById('posEntry').textContent = entryPrice ?? '--';
     document.getElementById('posCurrent').textContent = currentPrice ?? '--';
     const profitElement = document.getElementById('posProfit');
-    if (typeof liveProfit === 'number') {
+    if (liveProfit !== null) {
       profitElement.textContent = `${liveProfit >= 0 ? '+' : '−'}${symbolSign}${Math.abs(liveProfit).toFixed(2)}`;
       profitElement.className = liveProfit >= 0 ? 'positive' : 'negative';
+    } else if (Number.isFinite(entryPrice) && Number.isFinite(currentPrice)) {
+      const priceDifference = currentPrice - entryPrice;
+      const normalizedDirection = String(direction).toLowerCase();
+      const isAtEntry = priceDifference === 0;
+      const isInTheMoney = normalizedDirection === 'put'
+        ? priceDifference < 0
+        : priceDifference > 0;
+      profitElement.textContent = isAtEntry ? 'AT ENTRY' : isInTheMoney ? 'ITM' : 'OTM';
+      profitElement.className = isAtEntry ? 'cyan' : isInTheMoney ? 'positive' : 'negative';
     } else {
       profitElement.textContent = 'Waiting for broker data';
       profitElement.className = '';
@@ -631,32 +691,41 @@ function updateDashboard(state) {
     }).join('');
   }
 
-  // Render recent trades history table
   if (state.history && state.history.length > 0) {
-    // Show last 5 settled trades
-    const settled = state.history.filter(x => x.result !== 'pending').slice(-5).reverse();
-    if (settled.length > 0) {
-      tradeHistoryBody.innerHTML = settled.map(t => {
-        const timeStr = t.timestamp ? new Date(t.timestamp).toLocaleTimeString() : '--:--:--';
-        const isWin = t.result === 'win';
+    const recentTrades = [...state.history]
+      .sort((first, second) => {
+        const firstTime = dateFromBroker(first.timestamp)?.getTime() || 0;
+        const secondTime = dateFromBroker(second.timestamp)?.getTime() || 0;
+        return secondTime - firstTime;
+      })
+      .slice(0, 10);
+
+    if (recentTrades.length > 0) {
+      tradeHistoryBody.innerHTML = recentTrades.map(t => {
+        const result = String(t.result || 'unknown').toLowerCase();
+        const direction = String(t.direction || '--').toLowerCase();
+        const profit = Number(t.profit) || 0;
+        const isWin = result === 'win';
+        const isPending = result === 'pending';
+        const profitClass = isPending ? 'warning' : isWin ? 'positive' : result === 'equal' ? 'cyan' : 'negative';
+        const timeStr = formatLocalTime(t.timestamp);
         const symbolSign = '$';
         return `<tr>
           <td>${timeStr}</td>
           <td>${t.asset_name}</td>
-          <td><span class="dir ${t.direction.toLowerCase()}">${t.direction.toUpperCase()}</span></td>
+          <td><span class="dir ${direction}">${direction.toUpperCase()}</span></td>
           <td>RSI ${t.rsi_value ? t.rsi_value.toFixed(1) : '--'}</td>
           <td>${symbolSign}${t.amount}</td>
           <td>L${t.mg_level}</td>
-          <td><span class="result ${t.result}">${t.result.toUpperCase()}</span></td>
-          <td class="${isWin ? 'positive' : 'negative'}">${isWin ? '+' : t.result === 'canceled' ? '' : '−'}${symbolSign}${Math.abs(t.profit).toFixed(2)}</td>
-          <td>${t.close_price ? t.close_price.toFixed(2) : '--'}</td>
+          <td><span class="result ${result}">${result.toUpperCase()}</span></td>
+          <td class="${profitClass}">${isPending ? '--' : `${isWin ? '+' : result === 'canceled' ? '' : '−'}${symbolSign}${Math.abs(profit).toFixed(2)}`}</td>
         </tr>`;
       }).join('');
     } else {
-      tradeHistoryBody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--faint)">No settled trades this session</td></tr>';
+      tradeHistoryBody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--faint)">No trade records for this account</td></tr>';
     }
   } else {
-    tradeHistoryBody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--faint)">No settled trades this session</td></tr>';
+    tradeHistoryBody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--faint)">No trade records for this account</td></tr>';
   }
 
   // Render chart SVG logic based on history path

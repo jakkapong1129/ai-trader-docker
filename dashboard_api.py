@@ -104,6 +104,27 @@ async def get_trades(account_type: str, limit: int = 10):
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Trade history is temporarily unavailable") from exc
 
+@app.delete("/api/trades/{account_type}")
+async def clear_trades(account_type: str):
+    """Clear all trade history for one account, never both at once."""
+    if account_type not in ("demo", "real"):
+        raise HTTPException(status_code=400, detail="account_type must be 'demo' or 'real'")
+    if state_db.get("bot_status") == "Running":
+        raise HTTPException(status_code=409, detail="Stop or pause the bot before clearing trade history")
+
+    try:
+        from models import Database
+
+        deleted_count = Database().delete_trades_for_account(account_type)
+        if state_db.get("account_type") == account_type:
+            state_db["history"] = []
+        payload = json.dumps(state_db)
+        for q in clients:
+            await q.put(payload)
+        return {"status": "success", "account_type": account_type, "deleted_count": deleted_count}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Trade history is temporarily unavailable") from exc
+
 @app.post("/api/control")
 async def bot_control(action_req: Dict[str, str]):
     """Receives buttons clicks from dashboard and updates local file/db settings"""

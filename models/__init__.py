@@ -6,7 +6,7 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from contextlib import contextmanager
 
@@ -15,6 +15,21 @@ from models.strategy_state import StrategyState
 
 # Read from env (set by docker-compose or .env)
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://trader_user:trader_password_safe_99@localhost:5432/ai_trader")
+
+
+def normalize_utc_timestamp(value: str) -> str:
+    """Make legacy UTC timestamps explicit so clients can convert to local time."""
+    if not value or not isinstance(value, str):
+        return value
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
 
 class Database:
     """PostgreSQL database for AI Trader in Docker"""
@@ -63,12 +78,17 @@ class Database:
                         profit DOUBLE PRECISION DEFAULT 0.0,
                         close_price DOUBLE PRECISION DEFAULT 0.0,
                         close_time VARCHAR(50) DEFAULT '',
+                        broker_order_id VARCHAR(100) DEFAULT '',
+                        broker_position_id VARCHAR(100) DEFAULT '',
                         mg_level INTEGER DEFAULT 0,
                         session_hour INTEGER DEFAULT 0,
                         session_type VARCHAR(20) DEFAULT '',
                         account_type VARCHAR(20) DEFAULT 'demo'
                     );
                 """)
+                # Existing deployments need the column as well as new databases.
+                cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS broker_order_id VARCHAR(100) DEFAULT '';")
+                cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS broker_position_id VARCHAR(100) DEFAULT '';")
 
                 # Create strategy_states table
                 cursor.execute("""
@@ -99,6 +119,8 @@ class Database:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_result ON trades(result);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_broker_position_id ON trades(broker_position_id);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_broker_order_id ON trades(broker_order_id);")
 
     # ========== TRADE OPERATIONS ==========
 
@@ -111,18 +133,19 @@ class Database:
                         timestamp, asset_name, asset_id, strategy, direction,
                         amount, confidence, rsi_value, ema_fast, ema_slow,
                         bb_upper, bb_lower, bb_mid, atr_value, candle_pattern,
-                        trend_direction, result, profit, close_price, close_time,
+                        trend_direction, result, profit, close_price, close_time, broker_order_id, broker_position_id,
                         mg_level, session_hour, session_type, account_type
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
                     trade.timestamp, trade.asset_name, trade.asset_id,
                     trade.strategy, trade.direction, trade.amount, trade.confidence,
                     trade.rsi_value, trade.ema_fast, trade.ema_slow,
                     trade.bb_upper, trade.bb_lower, trade.bb_mid, trade.atr_value,
-                    trade.candle_pattern, trade.trend_direction, trade.result,
-                    trade.profit, trade.close_price, trade.close_time,
-                    trade.mg_level, trade.session_hour, trade.session_type, trade.account_type
+                        trade.candle_pattern, trade.trend_direction, trade.result,
+                        trade.profit, trade.close_price, trade.close_time,
+                        trade.broker_order_id, trade.broker_position_id,
+                        trade.mg_level, trade.session_hour, trade.session_type, trade.account_type
                 ))
                 row = cursor.fetchone()
                 return row[0]
@@ -136,13 +159,94 @@ class Database:
                     UPDATE trades 
                     SET result = %s, profit = %s, close_price = %s, close_time = %s
                     WHERE id = %s
-                """, (result, profit, close_price, datetime.now().isoformat(), trade_id))
+                """, (result, profit, close_price, datetime.now(timezone.utc).isoformat(), trade_id))
+
+    def update_trade_result_by_broker_position_id(self, broker_position_id: str,
+                                                  result: str, profit: float,
+                                                  close_price: float,
+                                                  close_time: str = ""):
+        """Update exactly the trade returned by the broker, never by asset name."""
+        if not broker_position_id:
+            raise ValueError("broker_position_id is required")
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE trades
+                    SET result = %s, profit = %s, close_price = %s, close_time = %s
+                    WHERE broker_position_id = %s AND result = 'pending'
+                """, (
+                    result, profit, close_price,
+                    close_time or datetime.now(timezone.utc).isoformat(),
+                    broker_position_id,
+                ))
+
+    def find_pending_trade_for_broker_result(self, asset_id: int, direction: str,
+                                             amount: float, open_time: str,
+                                             account_type: str) -> Optional[Trade]:
+        """Find the one bot trade matching a settled broker position.
+
+        The placement endpoint returns an order ID, while history returns a
+        different position ID.  Match the immutable entry details and time,
+        then persist the broker position ID once it is known.
+        """
+        try:
+            broker_opened_at = datetime.fromisoformat(open_time.replace("Z", "+00:00"))
+            if broker_opened_at.tzinfo is None:
+                broker_opened_at = broker_opened_at.replace(tzinfo=timezone.utc)
+        except (AttributeError, ValueError):
+            return None
+
+        candidates = []
+        for trade in self.get_trades(limit=100, result="pending", account_type=account_type):
+            if trade.asset_id != asset_id or trade.direction != direction:
+                continue
+            if abs(float(trade.amount) - float(amount)) > 0.000001:
+                continue
+            try:
+                opened_at = datetime.fromisoformat(trade.timestamp.replace("Z", "+00:00"))
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.replace(tzinfo=timezone.utc)
+            except (AttributeError, ValueError):
+                continue
+            if abs((opened_at - broker_opened_at).total_seconds()) <= 120:
+                candidates.append(trade)
+
+        return candidates[0] if len(candidates) == 1 else None
+
+    def record_broker_result(self, trade_id: int, broker_position_id: str,
+                             result: str, profit: float, close_price: float,
+                             close_time: str = ""):
+        """Attach the broker position ID and settle exactly one pending trade."""
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE trades
+                    SET broker_position_id = %s, result = %s, profit = %s,
+                        close_price = %s, close_time = %s
+                    WHERE id = %s AND result = 'pending'
+                """, (
+                    broker_position_id, result, profit, close_price,
+                    close_time or datetime.now(timezone.utc).isoformat(), trade_id,
+                ))
 
     def clear_past_losses(self):
         """Reset past losses by marking them as canceled so Martingale is reset"""
         with self._conn() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("UPDATE trades SET result = 'canceled' WHERE result = 'loss'")
+
+    def delete_trades_for_account(self, account_type: str) -> int:
+        """Delete all trade history for one account."""
+        if account_type not in ("demo", "real"):
+            raise ValueError("account_type must be 'demo' or 'real'")
+
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM trades WHERE account_type = %s",
+                    (account_type,),
+                )
+                return cursor.rowcount
 
     def get_trades(self, limit: int = 100, strategy: str = None,
                    asset: str = None, result: str = None,
@@ -355,7 +459,7 @@ class Database:
 
     def _row_to_trade(self, row) -> Trade:
         return Trade(
-            id=row["id"], timestamp=row["timestamp"],
+            id=row["id"], timestamp=normalize_utc_timestamp(row["timestamp"]),
             asset_name=row["asset_name"], asset_id=row["asset_id"],
             strategy=row["strategy"], direction=row["direction"],
             amount=row["amount"], confidence=row["confidence"],
@@ -365,7 +469,9 @@ class Database:
             atr_value=row["atr_value"], candle_pattern=row["candle_pattern"],
             trend_direction=row["trend_direction"], result=row["result"],
             profit=row["profit"], close_price=row["close_price"],
-            close_time=row["close_time"], mg_level=row["mg_level"],
+            close_time=normalize_utc_timestamp(row["close_time"]),
+            broker_order_id=row.get("broker_order_id", ""),
+            broker_position_id=row.get("broker_position_id", ""), mg_level=row["mg_level"],
             session_hour=row["session_hour"], session_type=row["session_type"],
             account_type=row.get("account_type", "demo"),
         )

@@ -14,6 +14,7 @@ log = logging.getLogger("ai_trader")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://9router.irobotsonline.com/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "mimo-text")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "YOUR_LLM_API_KEY_HERE")
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16000"))
 
 
 async def call_llm(prompt: str, system: str = "") -> str:
@@ -33,7 +34,7 @@ async def call_llm(prompt: str, system: str = "") -> str:
                 "model": LLM_MODEL,
                 "messages": messages,
                 "temperature": 0.3,
-                "max_tokens": 8000,
+                "max_tokens": LLM_MAX_TOKENS,
                 "stream": False,
             }
         )
@@ -59,7 +60,7 @@ def call_llm_sync(prompt: str, system: str = "") -> str:
                 "model": LLM_MODEL,
                 "messages": messages,
                 "temperature": 0.3,
-                "max_tokens": 8000,
+                "max_tokens": LLM_MAX_TOKENS,
                 "stream": False,
             }
         )

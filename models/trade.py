@@ -35,6 +35,8 @@ class Trade:
     profit: float = 0.0
     close_price: float = 0.0
     close_time: str = ""
+    broker_order_id: str = ""     # ID returned immediately by place_trade
+    broker_position_id: str = ""  # Stable ID returned by the broker for reconciliation
     
     # ML context
     mg_level: int = 0           # Martingale level (0 = first bet)
