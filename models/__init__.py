@@ -182,13 +182,19 @@ class Database:
 
     def find_pending_trade_for_broker_result(self, asset_id: int, direction: str,
                                              amount: float, open_time: str,
-                                             account_type: str) -> Optional[Trade]:
+                                             account_type: str, broker_order_id: str = "") -> Optional[Trade]:
         """Find the one bot trade matching a settled broker position.
 
         The placement endpoint returns an order ID, while history returns a
         different position ID.  Match the immutable entry details and time,
         then persist the broker position ID once it is known.
         """
+        # 1. Match by broker_order_id first (if provided and valid)
+        if broker_order_id:
+            for trade in self.get_trades(limit=100, result="pending", account_type=account_type):
+                if trade.broker_order_id and str(trade.broker_order_id) == str(broker_order_id):
+                    return trade
+
         try:
             broker_opened_at = datetime.fromisoformat(open_time.replace("Z", "+00:00"))
             if broker_opened_at.tzinfo is None:
@@ -196,11 +202,16 @@ class Database:
         except (AttributeError, ValueError):
             return None
 
+        normalized_direction = str(direction or "").strip().lower()
         candidates = []
+
+        # We increase time tolerance from 120s to 300s (5 minutes)
+        time_tolerance = 300.0
+
         for trade in self.get_trades(limit=100, result="pending", account_type=account_type):
-            if trade.asset_id != asset_id or trade.direction != direction:
+            if trade.asset_id != asset_id or str(trade.direction or "").strip().lower() != normalized_direction:
                 continue
-            if abs(float(trade.amount) - float(amount)) > 0.000001:
+            if abs(float(trade.amount) - float(amount)) > 0.01:
                 continue
             try:
                 opened_at = datetime.fromisoformat(trade.timestamp.replace("Z", "+00:00"))
@@ -208,10 +219,17 @@ class Database:
                     opened_at = opened_at.replace(tzinfo=timezone.utc)
             except (AttributeError, ValueError):
                 continue
-            if abs((opened_at - broker_opened_at).total_seconds()) <= 120:
-                candidates.append(trade)
 
-        return candidates[0] if len(candidates) == 1 else None
+            diff_sec = abs((opened_at - broker_opened_at).total_seconds())
+            if diff_sec <= time_tolerance:
+                candidates.append((trade, diff_sec))
+
+        if not candidates:
+            return None
+
+        # Sort by closest time match
+        candidates.sort(key=lambda x: x[1])
+        return candidates[0][0]
 
     def record_broker_result(self, trade_id: int, broker_position_id: str,
                              result: str, profit: float, close_price: float,
@@ -228,6 +246,33 @@ class Database:
                     broker_position_id, result, profit, close_price,
                     close_time or datetime.now(timezone.utc).isoformat(), trade_id,
                 ))
+
+    def expire_stale_pending_trades(self, account_type: str, max_age_minutes: int = 15) -> int:
+        """Mark pending trades older than max_age_minutes as 'expired'.
+
+        This prevents the bot from being permanently blocked when broker
+        result reconciliation fails (e.g. MCP history format mismatch,
+        clock drift, or network errors during settlement).
+        Returns the number of trades expired.
+        """
+        if account_type not in ("demo", "real"):
+            return 0
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).isoformat()
+        with self._conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE trades
+                    SET result = 'expired', close_time = %s
+                    WHERE result = 'pending'
+                      AND account_type = %s
+                      AND timestamp < %s
+                """, (
+                    datetime.now(timezone.utc).isoformat(),
+                    account_type,
+                    cutoff,
+                ))
+                return cursor.rowcount
 
     def clear_past_losses(self):
         """Reset past losses by marking them as canceled so Martingale is reset"""
@@ -250,7 +295,8 @@ class Database:
 
     def get_trades(self, limit: int = 100, strategy: str = None,
                    asset: str = None, result: str = None,
-                   days: int = None, account_type: str = None) -> list:
+                   days: int = None, account_type: str = None,
+                   offset: int = 0) -> list:
         """Query trades with filters"""
         conditions = []
         params = []
@@ -273,8 +319,8 @@ class Database:
             params.append(cutoff)
 
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
-        sql = f"SELECT * FROM trades {where} ORDER BY timestamp DESC LIMIT %s"
-        params.append(limit)
+        sql = f"SELECT * FROM trades {where} ORDER BY timestamp DESC LIMIT %s OFFSET %s"
+        params.extend((limit, max(0, offset)))
 
         with self._conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -282,6 +328,62 @@ class Database:
                 rows = cursor.fetchall()
 
         return [self._row_to_trade(r) for r in rows]
+
+    def get_trade_summary(self, account_type: str) -> dict:
+        if account_type not in ("demo", "real"):
+            raise ValueError("account_type must be 'demo' or 'real'")
+
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT
+                        COUNT(*) AS total_records,
+                        COUNT(*) FILTER (WHERE result <> 'pending') AS settled_trades,
+                        COUNT(*) FILTER (WHERE result = 'pending') AS pending_trades,
+                        COUNT(*) FILTER (WHERE result = 'win') AS wins,
+                        COUNT(*) FILTER (WHERE result = 'loss') AS losses,
+                        COUNT(*) FILTER (WHERE result = 'equal') AS equals,
+                        COUNT(*) FILTER (WHERE result = 'canceled') AS canceled,
+                        COALESCE(SUM(profit) FILTER (WHERE result <> 'pending'), 0) AS net_profit,
+                        COALESCE(SUM(amount) FILTER (WHERE result <> 'pending'), 0) AS total_staked
+                    FROM trades
+                    WHERE account_type = %s
+                """, (account_type,))
+                row = cursor.fetchone()
+
+        total_staked = float(row["total_staked"] or 0)
+        net_profit = float(row["net_profit"] or 0)
+        return {
+            "total_records": int(row["total_records"] or 0),
+            "settled_trades": int(row["settled_trades"] or 0),
+            "pending_trades": int(row["pending_trades"] or 0),
+            "wins": int(row["wins"] or 0),
+            "losses": int(row["losses"] or 0),
+            "equals": int(row["equals"] or 0),
+            "canceled": int(row["canceled"] or 0),
+            "net_profit": net_profit,
+            "total_staked": total_staked,
+            "roi_percent": (net_profit / total_staked * 100) if total_staked else 0.0,
+        }
+
+    def get_equity_history(self, account_type: str) -> list:
+        if account_type not in ("demo", "real"):
+            raise ValueError("account_type must be 'demo' or 'real'")
+
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT timestamp, profit
+                    FROM trades
+                    WHERE account_type = %s AND result <> 'pending'
+                    ORDER BY timestamp ASC
+                """, (account_type,))
+                rows = cursor.fetchall()
+
+        return [
+            {"timestamp": normalize_utc_timestamp(row["timestamp"]), "profit": float(row["profit"] or 0)}
+            for row in rows
+        ]
 
     def get_trade_count(self, strategy: str = None, asset: str = None,
                         result: str = None, days: int = None) -> int:

@@ -29,7 +29,11 @@ MCP_TOKEN = os.getenv("MCP_TOKEN", "Bearer YOUR_MCP_TOKEN_HERE")
 TRADE_AMOUNT = float(os.getenv("BASE_AMOUNT", "30"))     # Use BASE_AMOUNT from .env, default 30
 MG_MULTIPLIER = float(os.getenv("MG_MULTIPLIER", "2.0")) # Double after loss
 MG_MAX = int(os.getenv("MAX_MG_LEVEL", "5"))             # Max 5 levels
-LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "60"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", str(MG_MAX)))
+LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "45"))
+PRIMARY_LLM_MIN_CONFIDENCE = float(os.getenv("PRIMARY_LLM_MIN_CONFIDENCE", "55"))
+SECONDARY_LLM_MIN_CONFIDENCE = float(os.getenv("SECONDARY_LLM_MIN_CONFIDENCE", "65"))
+SECONDARY_MATH_MIN_CONFIDENCE = float(os.getenv("SECONDARY_MATH_MIN_CONFIDENCE", "58"))
 SAFETY_PAUSE_SEC = 30 * 60
 
 def get_account_type():
@@ -48,6 +52,14 @@ def get_account_type():
 
 ACCOUNT_TYPE = get_account_type()
 
+
+def remember_processed_result(processed_results: set, result_id: str) -> bool:
+    """Remember a broker result and return True only the first time it is seen."""
+    if result_id in processed_results:
+        return False
+    processed_results.add(result_id)
+    return True
+
 # Per-asset RSI OB/OS (will be optimized by learner)
 ASSET_PARAMS = {
     2117: {"rsi_ob": 75, "rsi_os": 28},  # EURCAD
@@ -57,7 +69,7 @@ ASSET_PARAMS = {
     76:   {"rsi_ob": 70, "rsi_os": 30},  # EURUSD
     81:   {"rsi_ob": 70, "rsi_os": 30},  # GBPUSD
     85:   {"rsi_ob": 70, "rsi_os": 30},  # USDJPY
-    84:   {"rsi_ob": 70, "rsi_os": 30},  # GBPJPY
+    2132: {"rsi_ob": 70, "rsi_os": 28},  # GBPNZD
     78:   {"rsi_ob": 70, "rsi_os": 30},  # USDCHF
     80:   {"rsi_ob": 70, "rsi_os": 30},  # NZDUSD
     86:   {"rsi_ob": 70, "rsi_os": 30},  # AUDCAD
@@ -66,7 +78,7 @@ ASSET_PARAMS = {
     2113: {"rsi_ob": 70, "rsi_os": 30},  # AUDJPY
     2118: {"rsi_ob": 70, "rsi_os": 30},  # CHFJPY
 }
-INTERVAL_SEC = 120       # Check every 2min (5-min candles need less frequent)
+INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
 OPEN_POSITION_POLL_SEC = 2
 CANDLE_SIZE = 300        # 5-min candles
 CANDLE_COUNT = 100       # Last 100 candles (500 min ~8 hours)
@@ -80,7 +92,7 @@ TRADE_ASSETS = {
     "EURUSD": 76,
     "GBPUSD": 81,
     "USDJPY": 85,
-    "GBPJPY": 84,
+    "GBPNZD": 2132,
     "USDCHF": 78,
     "NZDUSD": 80,
     "AUDCAD": 86,
@@ -105,6 +117,33 @@ def log(msg, level="INFO"):
             f.write(line + "\n")
     except:
         pass
+
+
+def timestamp_seconds(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e12 else float(value)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def completed_candles(candles):
+    if not candles:
+        return []
+    candle_end = timestamp_seconds(candles[-1].get("to"))
+    if candle_end and candle_end > time.time() + 1:
+        return candles[:-1]
+    return candles
+
+
+def candle_identity(candle):
+    for key in ("to", "from", "timestamp", "time", "id"):
+        if candle.get(key) is not None:
+            return str(candle[key])
+    return "|".join(str(candle.get(key, "")) for key in ("open", "close", "min", "max"))
 
 class MCPClient:
     """Async MCP client that maintains session"""
@@ -312,7 +351,6 @@ async def main():
     mg_level = 0  # 0=base, 1=x2, 2=x4, 3=x8
     last_trade_result = None  # 'win' or 'loss'
     consecutive_losses = 0
-    MAX_CONSECUTIVE_LOSSES = 3  # Stop after 3 losses in a row
     trading_paused = False
     pause_until = None
     has_open_trade = False  # Only 1 trade at a time
@@ -320,6 +358,7 @@ async def main():
     # Martingale chain. Recovered positions are saved to DB but never alter a
     # fresh process's MG state.
     tracked_trade_ids = {}
+    last_evaluated_signal_candle = {}
 
     def get_mg_amount():
         """Calculate current bet amount with martingale"""
@@ -451,8 +490,10 @@ async def main():
         try:
             # Get latest 10 trades from PostgreSQL filtered by current account type
             latest_trades_db = []
+            trade_summary = {}
             try:
                 latest_trades_db = [t.to_dict() for t in db_conn.get_trades(limit=10, account_type=current_account_type)]
+                trade_summary = db_conn.get_trade_summary(current_account_type)
             except Exception as e:
                 log(f"Error fetching DB trades for report: {e}", "DEBUG")
             
@@ -463,6 +504,8 @@ async def main():
                 "balance": 0.0,
                 "real_balance": 0.0,
                 "demo_balance": 0.0,
+                "real_currency": "USD",
+                "demo_currency": "USD",
                 "bot_status": status_str,
                 "bot_phase": phase or status_str,
                 "next_scan_at": next_scan_at,
@@ -472,6 +515,11 @@ async def main():
                 "total_trades": int(total_trades),
                 "total_wins": int(total_wins),
                 "total_losses": int(total_losses),
+                "trade_summary": trade_summary,
+                "base_amount": float(TRADE_AMOUNT),
+                "mg_multiplier": float(MG_MULTIPLIER),
+                "max_mg_level": int(MG_MAX),
+                "max_consecutive_losses": int(MAX_CONSECUTIVE_LOSSES),
                 "account_type": current_account_type,
                 "history": latest_trades_db,
                 "assets": active_assets_list
@@ -483,10 +531,13 @@ async def main():
             if isinstance(balances, list):
                 for balance_info in balances:
                     amount = float(balance_info.get("amount", 0.0))
+                    currency = str(balance_info.get("currency", "USD")).upper()
                     if balance_info.get("type") == "regular":
                         payload["real_balance"] = amount
+                        payload["real_currency"] = currency
                     elif balance_info.get("type") == "training":
                         payload["demo_balance"] = amount
+                        payload["demo_currency"] = currency
 
             payload["balance"] = payload[
                 "demo_balance" if current_account_type == "demo" else "real_balance"
@@ -577,41 +628,75 @@ async def main():
             has_open_trade = bool(open_positions)
         except Exception as e:
             log(f"Could not refresh open positions before scan: {e}", "DEBUG")
+            # If we can't reach the broker, check DB for stale pending trades.
+            # If none remain, it's safe to unlock.
+            try:
+                remaining_pending = db_conn.get_trades(limit=1, result="pending", account_type=current_account_type)
+                if not remaining_pending:
+                    has_open_trade = False
+            except Exception:
+                pass
         if not has_open_trade:
             await report_to_api("Running", "Scanning market")
         
         # ── Check previous trade results ──
         try:
             history = await client.get_history(50)
-            for trade in extract_history(history):
+            history_trades = extract_history(history)
+            if not history_trades:
+                log(f"⚠️ get_history returned empty or unparseable: {str(history)[:200]}", "DEBUG")
+            for trade in history_trades:
                 pos_id = extract_broker_id(trade, ("position_id", "positionId"))
+                order_id = extract_broker_id(trade, ("order_id", "orderId"))
                 result = trade.get("result", "unknown")
                 if result not in ("win", "loss", "equal"):
+                    log(f"⏭️ Skipping history entry with result='{result}': {str(trade)[:150]}", "DEBUG")
+                    continue
+                result_id = pos_id or order_id or "|".join([
+                    str(trade.get("asset_id", "")),
+                    str(trade.get("direction", "")).lower(),
+                    str(trade.get("amount", "")),
+                    str(trade.get("open_time", "")),
+                    str(trade.get("close_time", "")),
+                ])
+                if result_id in processed_trades:
                     continue
                 # Never let an unrelated/manual account trade change bot state.
+                broker_asset = int(trade.get("asset_id", 0))
+                broker_dir = str(trade.get("direction", "")).lower()
+                broker_amt = float(trade.get("amount", 0))
+                broker_open = trade.get("open_time", "")
                 pending_trade = db_conn.find_pending_trade_for_broker_result(
-                    asset_id=int(trade.get("asset_id", 0)),
-                    direction=str(trade.get("direction", "")).lower(),
-                    amount=float(trade.get("amount", 0)),
-                    open_time=trade.get("open_time", ""),
+                    asset_id=broker_asset,
+                    direction=broker_dir,
+                    amount=broker_amt,
+                    open_time=broker_open,
                     account_type=current_account_type,
-                ) if pos_id else None
-                if pending_trade and pos_id not in processed_trades:
+                    broker_order_id=order_id or "",
+                )
+                if not pending_trade:
+                    # Old/manual/already-settled broker history is not actionable.
+                    # Remember it so these same history rows are not retried and
+                    # logged again on every market scan.
+                    remember_processed_result(processed_trades, result_id)
+                    log(f"No pending DB match for broker result: asset={broker_asset} dir={broker_dir} amt={broker_amt} open={broker_open} result={result}", "DEBUG")
+                    continue
+                if pending_trade and result_id not in processed_trades:
                     affects_mg = tracked_trade_ids.pop(pending_trade.id, False)
-                    processed_trades.add(pos_id)
+                    processed_trades.add(result_id)
                     profit = trade.get("profit", 0)
                     if affects_mg and result in ("win", "loss"):
                         update_mg(result)
                     elif result == "equal":
                         log("➖ RESULT: equal — MG level unchanged", "TRADE")
                     else:
-                        log(f"📌 Recovered position {pos_id} settled; MG unchanged", "TRADE")
+                        log(f"📌 Recovered position {result_id} settled; MG unchanged", "TRADE")
                     emoji = {"win": "✅", "loss": "❌", "equal": "➖"}[result]
                     log(f"{emoji} RESULT: {trade.get('asset_name','')} {trade.get('direction','')} {result} ${float(profit):+.0f} (total: {total_wins}W/{total_losses}L)", "TRADE")
                     try:
                         db_conn.record_broker_result(
                             trade_id=pending_trade.id,
-                            broker_position_id=pos_id,
+                            broker_position_id=pos_id or order_id or result_id,
                             result=result,
                             profit=float(profit),
                             close_price=float(trade.get("close_price", 0.0)),
@@ -621,6 +706,14 @@ async def main():
                         log(f"⚠️ Failed to update DB trade result: {dbe2}", "WARN")
         except Exception as e:
             log(f"Could not refresh trade history: {e}", "WARN")
+
+        # Expire stale pending trades so the bot is not locked forever on reconciliation failure
+        try:
+            expired_count = db_conn.expire_stale_pending_trades(account_type=current_account_type, max_age_minutes=15)
+            if expired_count > 0:
+                log(f"🧹 Cleaned up {expired_count} stale pending trades (marked as expired)", "TRADE")
+        except Exception as ex_err:
+            log(f"⚠️ Failed to expire stale pending trades: {ex_err}", "WARN")
 
         if trading_paused:
             remaining = max(0, int((pause_until or asyncio.get_running_loop().time()) - asyncio.get_running_loop().time()))
@@ -663,9 +756,10 @@ async def main():
         for asset_name, asset_id in rotated_assets:
             try:
                 # Get candles
-                candles = await client.get_candles(asset_id)
+                broker_candles = await client.get_candles(asset_id)
+                candles = completed_candles(broker_candles)
                 if not candles or len(candles) < 50:
-                    log(f"{asset_name}: No candle data ({len(candles) if candles else 0} candles)")
+                    log(f"{asset_name}: No completed candle data ({len(candles) if candles else 0} candles)")
                     continue
                 
                 closes = [c["close"] for c in candles]
@@ -700,6 +794,19 @@ async def main():
                 # ── Check for Signal ──
                 if signal and signal.is_valid:
                     signals_found += 1
+                    signal_setup = signal.indicators.get("setup_type", "primary_cross")
+                    if signal_setup == "secondary_reversal" and signal.confidence < SECONDARY_MATH_MIN_CONFIDENCE:
+                        log(
+                            f"⏭️ Weak secondary signal skipped: {asset_name} math_conf={signal.confidence:.0f}%",
+                            "DEBUG",
+                        )
+                        continue
+                    signal_candle = candle_identity(candles[-1])
+                    dedupe_key = (current_account_type, asset_id)
+                    if last_evaluated_signal_candle.get(dedupe_key) == signal_candle:
+                        log(f"⏭️ Duplicate signal skipped: {asset_name} candle={signal_candle}", "DEBUG")
+                        continue
+                    last_evaluated_signal_candle[dedupe_key] = signal_candle
                     log(f"🎯 SIGNAL: {asset_name} {signal.direction.upper()} conf={signal.confidence:.0f}%", "SIGNAL")
                     
                     # ── LLM Confirmation (only when math signal exists) ──
@@ -722,6 +829,7 @@ async def main():
                 
                     indicators = {
                         "rsi": rsi,
+                        "prev_rsi": signal.indicators.get("prev_rsi", rsi),
                         "ema_fast": ema_fast[-1] if ema_fast else 0,
                         "ema_slow": ema_slow[-1] if ema_slow else 0,
                         "trend": trend,
@@ -731,6 +839,11 @@ async def main():
                         "bb_mid": bb_mid,
                         "pattern": pattern,
                         "recent_candles": candles[-10:],
+                        "signal_direction": signal.direction,
+                        "signal_setup": signal_setup,
+                        "signal_reason": signal.reason,
+                        "math_confidence": signal.confidence,
+                        "account_type": current_account_type,
                     }
                     
                     try:
@@ -743,6 +856,11 @@ async def main():
                         continue
                     action = llm_result["action"]
                     confidence = llm_result["confidence"]
+                    required_confidence = (
+                        SECONDARY_LLM_MIN_CONFIDENCE
+                        if signal_setup == "secondary_reversal"
+                        else PRIMARY_LLM_MIN_CONFIDENCE
+                    )
                     
                     log(f"🤖 LLM: {asset_name} → {action} conf={confidence:.0f}%", "LLM")
                     log(f"   💬 {llm_result['reason']}", "LLM")
@@ -752,8 +870,8 @@ async def main():
                         log(f"⏸️ PAUSED: Safety stop active, skipping trade")
                     elif has_open_trade:
                         log(f"⏳ มีไม้เปิดอยู่ รอผลก่อน")
-                    elif action in ("CALL", "PUT") and confidence >= 45:
-                        direction = action.lower()
+                    elif action == signal.direction.upper() and confidence >= required_confidence:
+                        direction = signal.direction
                         trend_note = " ⚠️ counter-trend" if (action == "CALL" and trend == "down") else ""
                         current_amount = get_mg_amount()
                         mg_info = f" (MG:{mg_level}=${current_amount})" if mg_level > 0 else ""
@@ -812,7 +930,9 @@ async def main():
                         else:
                             log(f"❌ Trade failed!", "ERROR")
                     else:
-                        log(f"⏭️ Skip: action={action} conf={confidence:.0f}%")
+                        log(
+                            f"⏭️ Skip: action={action} conf={confidence:.0f}% required={required_confidence:.0f}%"
+                        )
                 
             except Exception as e:
                 log(f"{asset_name}: Error - {e}", "ERROR")

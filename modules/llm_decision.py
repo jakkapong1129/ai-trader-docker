@@ -14,7 +14,7 @@ log = logging.getLogger("ai_trader")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://9router.irobotsonline.com/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "mimo-text")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "YOUR_LLM_API_KEY_HERE")
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16000"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 
 
 async def call_llm(prompt: str, system: str = "") -> str:
@@ -69,25 +69,25 @@ def call_llm_sync(prompt: str, system: str = "") -> str:
         return data["choices"][0]["message"]["content"]
 
 
-SYSTEM_PROMPT = """You are an aggressive digital options trader for IQ Option OTC Forex.
+SYSTEM_PROMPT = """You are a risk-aware confirmation gate for IQ Option OTC digital options.
 
-CONTEXT: The Math AI (RSI/EMA/Bollinger) already confirmed this signal. Your job is to CONFIRM or REJECT it. Lean towards CONFIRM unless there's a clear reason not to.
+CONTEXT: The deterministic Math strategy already selected a direction. Your only job is to CONFIRM that exact direction or return NO_TRADE.
 
 Rules:
-- Math AI already detected RSI crossing OB/OS — this is a REVERSAL signal, trust it
+- Never reverse or replace the Math direction
+- Confirm only when price action and indicators support the supplied Math direction
 - OTC markets trade 24/7 — ignore session timing (Asian/London/NY doesn't matter)
-- If RSI crossed above oversold → CALL is valid (expect bounce up)
-- If RSI crossed below overbought → PUT is valid (expect pullback down)
-- Only say NO_TRADE if RSI is clearly mid-range (40-60) or trend strongly contradicts
-- Confidence ≥ 50% = trade. Don't be overly cautious
-- This is DEMO account ($4000+) — safe to experiment
+- Treat REAL accounts conservatively
+- Reject secondary_reversal setups with a doji, weak RSI movement, or no reversal candle against the trend
+- Return NO_TRADE when the signal is stale, contradictory, or poorly confirmed
+- Confidence measures confirmation quality, not a new trade direction
 
 You MUST respond in this exact JSON format:
 {
   "action": "CALL" or "PUT" or "NO_TRADE",
   "confidence": 0-100,
-  "reason": "brief explanation in Thai",
-  "risk_factors": "potential risks in Thai"
+  "reason": "เหตุผลสั้น ๆ ไม่เกิน 1 ประโยค ภาษาไทย",
+  "risk_factors": "ความเสี่ยงสั้น ๆ ภาษาไทย"
 }
 
 Respond ONLY with the JSON, nothing else."""
@@ -111,12 +111,24 @@ def build_analysis_prompt(asset: str, indicators: dict,
     else:
         session = "London-NY Overlap (volatility สูงสุด)"
 
+    signal_direction = str(indicators.get("signal_direction", "")).upper()
+    account_type = str(indicators.get("account_type", "unknown")).upper()
+    previous_rsi = float(indicators.get("prev_rsi", indicators.get("rsi", 0)))
+
     prompt = f"""📊 วิเคราะห์ {asset} เวลา {now.strftime('%H:%M:%S')} (UTC+7)
 
 === Market Data ===
 Session: {session}
+Account: {account_type}
+
+=== Math Signal (direction is locked) ===
+- Required direction: {signal_direction}
+- Setup: {indicators.get('signal_setup', 'N/A')}
+- Math confidence: {indicators.get('math_confidence', 0):.1f}
+- Signal reason: {indicators.get('signal_reason', 'N/A')}
 
 Indicators:
+- Previous RSI(14): {previous_rsi:.1f}
 - RSI(14): {indicators.get('rsi', 'N/A'):.1f}
 - EMA Fast(9): {indicators.get('ema_fast', 'N/A'):.5f}
 - EMA Slow(21): {indicators.get('ema_slow', 'N/A'):.5f}
@@ -151,7 +163,7 @@ Candles (last 5):
 """
 
     prompt += """
-ตัดสินใจ: ควรเทรด CALL, PUT, หรือ NO_TRADE?
+ยืนยันเฉพาะ {signal_direction} หรือเลือก NO_TRADE ห้ามเปลี่ยนเป็นทิศอื่น
 ตอบเป็น JSON เท่านั้น"""
 
     return prompt
@@ -197,6 +209,22 @@ def parse_llm_response(response: str) -> dict:
         }
 
 
+def constrain_confirmation(result: dict, expected_direction: str) -> dict:
+    expected_action = str(expected_direction).upper()
+    action = str(result.get("action", "NO_TRADE")).upper()
+    if expected_action not in ("CALL", "PUT"):
+        return result
+    if action in (expected_action, "NO_TRADE"):
+        return result
+
+    return {
+        **result,
+        "action": "NO_TRADE",
+        "confidence": 0,
+        "reason": f"Rejected direction mismatch: Math={expected_action}, LLM={action}",
+        "risk_factors": "LLM attempted to reverse the deterministic signal",
+    }
+
 class LLMDecisionMaker:
     """
     Uses mimo-text @ 9router as the brain for trading decisions.
@@ -226,6 +254,10 @@ class LLMDecisionMaker:
             self.call_count += 1
 
             result = parse_llm_response(response)
+            result = constrain_confirmation(
+                result,
+                indicators.get("signal_direction", ""),
+            )
             self.last_response = result
 
             log.info(

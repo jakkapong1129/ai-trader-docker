@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="AI Trader Command Deck API")
 SHARED_DIR = "/app/shared"
@@ -35,6 +35,8 @@ state_db: Dict[str, Any] = {
     "balance": 0.0,
     "real_balance": 0.0,
     "demo_balance": 0.0,
+    "real_currency": "USD",
+    "demo_currency": "USD",
     "active_assets": [],
     "bot_status": "Stopped",  # Running, Paused, Stopped
     "bot_phase": "Stopped",
@@ -45,6 +47,11 @@ state_db: Dict[str, Any] = {
     "total_trades": 0,
     "total_wins": 0,
     "total_losses": 0,
+    "trade_summary": {},
+    "base_amount": 30.0,
+    "mg_multiplier": 2.0,
+    "max_mg_level": 5,
+    "max_consecutive_losses": 3,
     "account_type": get_selected_account_type(),
     "history": [],
     "assets": []
@@ -56,6 +63,8 @@ class StateUpdate(BaseModel):
     balance: float
     real_balance: float
     demo_balance: float
+    real_currency: str = "USD"
+    demo_currency: str = "USD"
     bot_status: str
     bot_phase: str
     next_scan_at: Optional[str] = None
@@ -65,6 +74,11 @@ class StateUpdate(BaseModel):
     total_trades: int
     total_wins: int
     total_losses: int
+    trade_summary: Dict[str, Any] = Field(default_factory=dict)
+    base_amount: float = 30.0
+    mg_multiplier: float = 2.0
+    max_mg_level: int = 5
+    max_consecutive_losses: int = 3
     account_type: str
     history: List[Dict[str, Any]]
     assets: List[Dict[str, Any]]
@@ -88,7 +102,7 @@ async def get_state():
     return state_db
 
 @app.get("/api/trades")
-async def get_trades(account_type: str, limit: int = 10):
+async def get_trades(account_type: str, limit: int = 10, offset: int = 0):
     """Return trade history for the account selected in the dashboard."""
     if account_type not in ("demo", "real"):
         raise HTTPException(status_code=400, detail="account_type must be 'demo' or 'real'")
@@ -96,10 +110,23 @@ async def get_trades(account_type: str, limit: int = 10):
     try:
         from models import Database
 
-        trades = Database().get_trades(limit=max(1, min(limit, 100)), account_type=account_type)
+        database = Database()
+        page_limit = max(1, min(limit, 100))
+        page_offset = max(0, offset)
+        trades = database.get_trades(
+            limit=page_limit,
+            offset=page_offset,
+            account_type=account_type,
+        )
         return {
             "account_type": account_type,
             "history": [trade.to_dict() for trade in trades],
+            "summary": database.get_trade_summary(account_type),
+            "equity": database.get_equity_history(account_type),
+            "pagination": {
+                "limit": page_limit,
+                "offset": page_offset,
+            },
         }
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Trade history is temporarily unavailable") from exc
@@ -118,6 +145,7 @@ async def clear_trades(account_type: str):
         deleted_count = Database().delete_trades_for_account(account_type)
         if state_db.get("account_type") == account_type:
             state_db["history"] = []
+            state_db["trade_summary"] = {}
         payload = json.dumps(state_db)
         for q in clients:
             await q.put(payload)
@@ -201,4 +229,7 @@ async def sse_endpoint(request: Request):
 # Host dashboard directly under root /
 @app.get("/")
 async def get_dashboard():
-    return FileResponse("dashboard-command-deck.html")
+    return FileResponse(
+        "dashboard-command-deck.html",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )

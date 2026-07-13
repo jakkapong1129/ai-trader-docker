@@ -24,17 +24,17 @@ def calc_rsi(closes: list[float], period: int = 14) -> list[float]:
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    for i in range(period, len(gains)):
+    def current_rsi() -> float:
         if avg_loss == 0:
-            rsi_values.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            rsi_values.append(100 - (100 / (1 + rs)))
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
 
-        # Smoothed average
-        if i < len(gains):
-            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    rsi_values.append(current_rsi())
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rsi_values.append(current_rsi())
 
     return rsi_values
 
@@ -148,6 +148,8 @@ class RSIReversalStrategy(BaseStrategy):
             "ema_fast": 9,
             "ema_slow": 21,
             "atr_period": 14,
+            "rsi_reentry_margin": 5,
+            "rsi_rebound_min": 1.5,
         }
 
     def get_param_ranges(self) -> dict:
@@ -190,14 +192,16 @@ class RSIReversalStrategy(BaseStrategy):
         # === SIGNAL LOGIC ===
         signal = None
 
-        # CALL: RSI crosses above oversold (reversal up)
+        setup_type = ""
+
         if prev_rsi < p["rsi_os"] and current_rsi >= p["rsi_os"]:
+            setup_type = "primary_cross"
             confidence = self._calc_confidence(
-                rsi=current_rsi, threshold=p["rsi_os"],
+                rsi=current_rsi, previous_rsi=prev_rsi, threshold=p["rsi_os"],
                 trend=trend, favorable_trend="up",
                 pattern=pattern, favorable_patterns=["bullish_engulfing", "hammer"],
                 volatility=volatility,
-                direction="call"
+                direction="call", setup_type=setup_type,
             )
             if confidence > 0:
                 signal = Signal(
@@ -206,20 +210,20 @@ class RSIReversalStrategy(BaseStrategy):
                     strategy_name=self.name,
                     reason=f"RSI {current_rsi:.1f} crossing above OS {p['rsi_os']}, trend={trend}, pattern={pattern}",
                     indicators={
-                        "rsi": current_rsi, "trend": trend,
+                        "rsi": current_rsi, "prev_rsi": prev_rsi, "trend": trend,
                         "atr": current_atr, "pattern": pattern,
-                        "volatility": volatility,
+                        "volatility": volatility, "setup_type": setup_type,
                     }
                 )
 
-        # PUT: RSI crosses below overbought (reversal down)
         elif prev_rsi > p["rsi_ob"] and current_rsi <= p["rsi_ob"]:
+            setup_type = "primary_cross"
             confidence = self._calc_confidence(
-                rsi=current_rsi, threshold=p["rsi_ob"],
+                rsi=current_rsi, previous_rsi=prev_rsi, threshold=p["rsi_ob"],
                 trend=trend, favorable_trend="down",
                 pattern=pattern, favorable_patterns=["bearish_engulfing", "shooting_star"],
                 volatility=volatility,
-                direction="put"
+                direction="put", setup_type=setup_type,
             )
             if confidence > 0:
                 signal = Signal(
@@ -228,36 +232,102 @@ class RSIReversalStrategy(BaseStrategy):
                     strategy_name=self.name,
                     reason=f"RSI {current_rsi:.1f} crossing below OB {p['rsi_ob']}, trend={trend}, pattern={pattern}",
                     indicators={
-                        "rsi": current_rsi, "trend": trend,
+                        "rsi": current_rsi, "prev_rsi": prev_rsi, "trend": trend,
                         "atr": current_atr, "pattern": pattern,
-                        "volatility": volatility,
+                        "volatility": volatility, "setup_type": setup_type,
                     }
+                )
+
+        else:
+            margin = p.get("rsi_reentry_margin", 5)
+            rebound_min = p.get("rsi_rebound_min", 1.5)
+            current_candle = candles[-1]
+            bullish_candle = current_candle["close"] > current_candle["open"]
+            bearish_candle = current_candle["close"] < current_candle["open"]
+            candle_range = current_candle["max"] - current_candle["min"]
+            body_ratio = abs(current_candle["close"] - current_candle["open"]) / candle_range if candle_range > 0 else 0
+            bullish_reversal = pattern in ("bullish_engulfing", "hammer")
+            bearish_reversal = pattern in ("bearish_engulfing", "shooting_star")
+            call_confirmation = bullish_reversal or (trend != "down" and body_ratio >= 0.25)
+            put_confirmation = bearish_reversal or (trend != "up" and body_ratio >= 0.25)
+            rsi_change = current_rsi - prev_rsi
+
+            if (
+                current_rsi <= p["rsi_os"] + margin
+                and rsi_change >= rebound_min
+                and bullish_candle
+                and pattern != "doji"
+                and call_confirmation
+            ):
+                setup_type = "secondary_reversal"
+                confidence = self._calc_confidence(
+                    rsi=current_rsi, previous_rsi=prev_rsi, threshold=p["rsi_os"],
+                    trend=trend, favorable_trend="up",
+                    pattern=pattern, favorable_patterns=["bullish_engulfing", "hammer"],
+                    volatility=volatility,
+                    direction="call", setup_type=setup_type,
+                )
+                signal = Signal(
+                    direction="call",
+                    confidence=confidence,
+                    strategy_name=self.name,
+                    reason=f"RSI rebound +{rsi_change:.1f} near OS {p['rsi_os']}, bullish confirmation, trend={trend}, pattern={pattern}",
+                    indicators={
+                        "rsi": current_rsi, "prev_rsi": prev_rsi, "trend": trend,
+                        "atr": current_atr, "pattern": pattern,
+                        "volatility": volatility, "setup_type": setup_type,
+                    },
+                )
+            elif (
+                current_rsi >= p["rsi_ob"] - margin
+                and rsi_change <= -rebound_min
+                and bearish_candle
+                and pattern != "doji"
+                and put_confirmation
+            ):
+                setup_type = "secondary_reversal"
+                confidence = self._calc_confidence(
+                    rsi=current_rsi, previous_rsi=prev_rsi, threshold=p["rsi_ob"],
+                    trend=trend, favorable_trend="down",
+                    pattern=pattern, favorable_patterns=["bearish_engulfing", "shooting_star"],
+                    volatility=volatility,
+                    direction="put", setup_type=setup_type,
+                )
+                signal = Signal(
+                    direction="put",
+                    confidence=confidence,
+                    strategy_name=self.name,
+                    reason=f"RSI rebound {rsi_change:.1f} near OB {p['rsi_ob']}, bearish confirmation, trend={trend}, pattern={pattern}",
+                    indicators={
+                        "rsi": current_rsi, "prev_rsi": prev_rsi, "trend": trend,
+                        "atr": current_atr, "pattern": pattern,
+                        "volatility": volatility, "setup_type": setup_type,
+                    },
                 )
 
         return signal
 
-    def _calc_confidence(self, rsi: float, threshold: float,
+    def _calc_confidence(self, rsi: float, previous_rsi: float, threshold: float,
                          trend: str, favorable_trend: str,
                          pattern: str, favorable_patterns: list,
-                         volatility: float, direction: str) -> float:
+                         volatility: float, direction: str,
+                         setup_type: str = "primary_cross") -> float:
         """Calculate confidence score 0-100"""
-        score = 50.0  # Base
+        score = 55.0 if setup_type == "primary_cross" else 48.0
 
-        # RSI extremity bonus
         if direction == "call":
-            # Lower RSI = stronger signal
-            score += max(0, (threshold - rsi) * 1.5)
+            score += min(15, max(0, (threshold - min(previous_rsi, rsi)) * 1.5))
         else:
-            # Higher RSI = stronger signal
-            score += max(0, (rsi - threshold) * 1.5)
+            score += min(15, max(0, (max(previous_rsi, rsi) - threshold) * 1.5))
 
-        # Trend alignment bonus
+        score += min(10, abs(rsi - previous_rsi) * 1.5)
+
         if trend == favorable_trend:
-            score += 15
+            score += 3
         elif trend == "sideways":
-            score += 5
+            score += 8
         else:
-            score -= 10  # Counter-trend penalty
+            score -= 3
 
         # Candle pattern bonus
         if pattern in favorable_patterns:
